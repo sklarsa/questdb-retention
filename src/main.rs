@@ -6,6 +6,7 @@ use postgres::{Client, NoTls};
 use prompts::{text::TextPrompt, Prompt};
 use serde::{Deserialize, Serialize};
 use serde_yaml;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self};
 use std::fs::File;
@@ -157,23 +158,21 @@ struct Args {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
-    tables: Vec<Table>,
+    tables: HashMap<String, i64>,
     conn_str: String,
 }
 
 fn main() {
     let args = Args::parse();
     let mut conn_str = String::from("host=localhost user=admin password=quest port=8812");
+    let mut tables: HashMap<String, i64> = HashMap::new();
 
     if args.config_path != "" {
         match File::open(args.config_path) {
             Ok(f) => match serde_yaml::from_reader::<File, Config>(f) {
                 Ok(c) => {
-                    if c.conn_str != "" {
-                        conn_str = c.conn_str
-                    }
-
-                    println!("conn string = '{}'", conn_str)
+                    conn_str = c.conn_str;
+                    tables = c.tables;
                 }
                 Err(e) => {
                     println!("invalid config: {}", e);
@@ -252,6 +251,27 @@ fn main() {
                 println!("no table supplied... exiting");
                 exit(1)
             }
+            Err(e) => println!("error: {}", e),
+        }
+
+        exit(0);
+    }
+
+    for t in tables.keys() {
+        match client.query_one("SELECT * FROM tables() WHERE name=$1", &[t]) {
+            Ok(r) => match row_to_table(&r) {
+                Ok(t) => {
+                    match new_retention_period(tables.get(&t.name).unwrap().clone(), t.partition_by)
+                    {
+                        Ok(p) => match run(&mut client, &t.name, p) {
+                            Ok(n) => println!("{} rows deleted from {}", n, t.name),
+                            Err(e) => println!("error evaluating table '{}': {}", t.name, e),
+                        },
+                        Err(e) => println!("{}", e),
+                    }
+                }
+                Err(e) => println!("{}", e),
+            },
             Err(e) => println!("error: {}", e),
         }
     }
