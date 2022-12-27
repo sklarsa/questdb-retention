@@ -117,10 +117,7 @@ fn get_timestamp_col(client: &mut Client, table: &String) -> Result<String, post
         "SELECT designatedTimestamp FROM tables() WHERE name='{}'",
         table
     );
-    match client.query_one(&query, &[]) {
-        Ok(r) => Ok(r.get("designatedTimestamp")),
-        Err(e) => Err(e),
-    }
+    Ok(client.query_one(&query, &[])?.get("designatedTimestamp"))
 }
 
 fn get_oldest_timestamp(p: RetentionPeriod) -> Result<DateTime<Utc>, RetentionPeriodError> {
@@ -134,33 +131,19 @@ fn get_oldest_timestamp(p: RetentionPeriod) -> Result<DateTime<Utc>, RetentionPe
     }
 }
 
-fn run(client: &mut Client, table: &String, p: RetentionPeriod) -> Result<(), Box<dyn Error>> {
+fn run(client: &mut Client, table: &String, p: RetentionPeriod) -> Result<u64, Box<dyn Error>> {
     // Get timestamp column
-    let mut timestamp_col = String::from("");
-    match get_timestamp_col(client, table) {
-        Ok(t) => timestamp_col = t,
-        Err(e) => return Err(Box::new(e)),
-    }
+    let timestamp_col = get_timestamp_col(client, table)?;
 
     // Get oldest timestamp to keep
-    let mut timestamp: DateTime<Utc> = DateTime::default();
-    match get_oldest_timestamp(p) {
-        Ok(d) => timestamp = d,
-        Err(e) => return Err(Box::new(e)),
-    }
+    let timestamp: DateTime<Utc> = get_oldest_timestamp(p)?;
 
     // Drop all partitions earlier than that timestamp
     let query = format!(
         "ALTER TABLE {} DROP PARTITION WHERE {} < to_timestamp('{}', 'yyyy-MM-dd:HH:mm:ss')",
         table, timestamp_col, timestamp
     );
-    match client.execute(&query, &[]) {
-        Ok(n) => {
-            println!("{} rows deleted", n);
-            return Ok(());
-        }
-        Err(e) => Err(Box::new(e)),
-    }
+    Ok(client.execute(&query, &[])?)
 }
 
 #[derive(Parser, Debug)]
@@ -236,7 +219,7 @@ fn main() {
 
                     println!("Deleting old partitions...");
                     match run(&mut client, &table.name, p) {
-                        Ok(()) => println!("done!"),
+                        Ok(d) => println!("deleted {} rows", d),
                         Err(e) => println!("error: {}", e),
                     }
                 }
