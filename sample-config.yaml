@@ -1,0 +1,5 @@
+---
+conn_str: host=localhost user=admin password=quest port=8812
+tables:
+  my_partitioned_table_by_month: 5
+  my_partitioned_table_by_day: 5
