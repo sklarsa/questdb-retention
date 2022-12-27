@@ -1,4 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
+use clap::Parser;
 use futures::executor::block_on;
 use postgres::row::Row;
 use postgres::{Client, NoTls};
@@ -9,13 +10,15 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self};
 use std::fs::File;
+use std::process::exit;
 use std::str::FromStr;
 
 #[derive(Debug)]
 enum RetentionPeriodError {
-    UnsupportedPartitionBy(PartitionBy),
-    InvalidPartitionBy(PartitionBy),
     InvalidAmount(i64),
+    InvalidPartitionBy(PartitionBy),
+    UnsupportedPartitionBy(PartitionBy),
+    UnknownPartitionBy(String),
 }
 
 impl Error for RetentionPeriodError {
@@ -32,6 +35,9 @@ impl fmt::Display for RetentionPeriodError {
             }
             RetentionPeriodError::InvalidPartitionBy(x) => write!(f, "invalid PartitionBy {}", x),
             RetentionPeriodError::InvalidAmount(x) => write!(f, "invalid Amount {}", x),
+            RetentionPeriodError::UnknownPartitionBy(x) => {
+                write!(f, "unknown PartitionBy value: '{}'", x)
+            }
         }
     }
 }
@@ -76,7 +82,7 @@ impl fmt::Display for PartitionBy {
 }
 
 impl FromStr for PartitionBy {
-    type Err = ();
+    type Err = RetentionPeriodError;
 
     fn from_str(input: &str) -> Result<PartitionBy, Self::Err> {
         match input {
@@ -85,7 +91,7 @@ impl FromStr for PartitionBy {
             "MONTH" => Ok(PartitionBy::Month),
             "DAY" => Ok(PartitionBy::Day),
             "HOUR" => Ok(PartitionBy::Hour),
-            _ => Err(()),
+            _ => Err(RetentionPeriodError::UnknownPartitionBy(input.to_string())),
         }
     }
 }
@@ -96,15 +102,14 @@ struct Table {
     partition_by: PartitionBy,
 }
 
-fn row_to_table(r: &Row) -> Table {
-    Table {
-        name: r.get("name"),
-        partition_by: PartitionBy::from_str(r.get("partitionBy")).unwrap(),
+fn row_to_table(r: &Row) -> Result<Table, RetentionPeriodError> {
+    match PartitionBy::from_str(r.get("partitionBy")) {
+        Ok(p) => Ok(Table {
+            name: r.get("name"),
+            partition_by: p,
+        }),
+        Err(e) => Err(e),
     }
-}
-
-fn parse_config_file(f: File) -> Result<Vec<Table>, serde_yaml::Error> {
-    serde_yaml::from_reader(f)
 }
 
 fn get_timestamp_col(client: &mut Client, table: &String) -> Result<String, postgres::Error> {
@@ -158,13 +163,50 @@ fn run(client: &mut Client, table: &String, p: RetentionPeriod) -> Result<(), Bo
     }
 }
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value = "")]
+    config_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Config {
+    tables: Vec<Table>,
+    conn_str: String,
+}
+
 fn main() {
+    let args = Args::parse();
+    let mut conn_str = String::from("host=localhost user=admin password=quest port=8812");
+
+    if args.config_path != "" {
+        match File::open(args.config_path) {
+            Ok(f) => match serde_yaml::from_reader::<File, Config>(f) {
+                Ok(c) => {
+                    if c.conn_str != "" {
+                        conn_str = c.conn_str
+                    }
+
+                    println!("conn string = '{}'", conn_str)
+                }
+                Err(e) => {
+                    println!("invalid config: {}", e);
+                    exit(1);
+                }
+            },
+            Err(e) => {
+                println!("error opening config: {}", e);
+                exit(1);
+            }
+        }
+    }
+
     let mut periods = HashMap::new();
-    let mut client =
-        Client::connect("host=localhost user=admin password=quest port=8812", NoTls).unwrap();
+    let mut client = Client::connect(&conn_str, NoTls).unwrap();
     println!("tables:");
     for row in client.query("tables()", &[]).unwrap() {
-        let table = row_to_table(&row);
+        let table = row_to_table(&row).unwrap();
         println!(
             "name: '{}' is partitioned by '{}'",
             table.name, table.partition_by
@@ -178,7 +220,7 @@ fn main() {
             .with_validator(|s| -> Result<(), String> {
                 match s.parse::<i32>() {
                     Ok(..) => Ok(()),
-                    Err(e) => Err(format!("{}", e)),
+                    Err(e) => Err(format!("error: {}", e)),
                 }
             });
 
@@ -192,10 +234,10 @@ fn main() {
                         p.amount, p.partition_by, table.name
                     );
 
-                    println!("Now running cleanup...");
+                    println!("Deleting old partitions...");
                     match run(&mut client, &table.name, p) {
                         Ok(()) => println!("done!"),
-                        Err(e) => println!("{}", e),
+                        Err(e) => println!("error: {}", e),
                     }
                 }
                 Ok(None) => println!("You typed nothing"),
