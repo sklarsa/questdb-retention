@@ -6,7 +6,6 @@ use postgres::{Client, NoTls};
 use prompts::{text::TextPrompt, Prompt};
 use serde::{Deserialize, Serialize};
 use serde_yaml;
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self};
 use std::fs::File;
@@ -151,6 +150,9 @@ fn run(client: &mut Client, table: &String, p: RetentionPeriod) -> Result<u64, B
 struct Args {
     #[arg(short, long, default_value = "")]
     config_path: String,
+
+    #[arg(short, long)]
+    interactive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,47 +187,72 @@ fn main() {
         }
     }
 
-    let mut periods = HashMap::new();
     let mut client = Client::connect(&conn_str, NoTls).unwrap();
-    println!("tables:");
-    for row in client.query("tables()", &[]).unwrap() {
-        let table = row_to_table(&row).unwrap();
-        println!(
-            "name: '{}' is partitioned by '{}'",
-            table.name, table.partition_by
-        );
 
-        if table.partition_by != PartitionBy::None {
-            let mut prompt = TextPrompt::new(format!(
-                "how many {}s do you want to retain?",
-                table.partition_by
-            ))
-            .with_validator(|s| -> Result<(), String> {
-                match s.parse::<i32>() {
-                    Ok(..) => Ok(()),
-                    Err(e) => Err(format!("error: {}", e)),
-                }
-            });
+    if args.interactive {
+        let mut prompt = TextPrompt::new(format!("which table do you want to truncate?"));
 
-            match block_on(prompt.run()) {
-                Ok(Some(a)) => {
-                    let p = new_retention_period(a.parse::<i64>().unwrap(), table.partition_by)
-                        .unwrap();
-                    periods.insert(table.name.clone(), p.clone());
-                    println!(
-                        "Added retention period of {} {}s for {}",
-                        p.amount, p.partition_by, table.name
-                    );
+        match block_on(prompt.run()) {
+            Ok(Some(t)) => {
+                for row in client.query("tables()", &[]).unwrap() {
+                    if String::from_str(row.get("name")).unwrap() == t {
+                        let table = row_to_table(&row).unwrap();
+                        if table.partition_by == PartitionBy::None {
+                            println!(
+                                "table {} partitionBy == NONE, cannot evaluation retention",
+                                t
+                            );
+                            exit(1);
+                        }
 
-                    println!("Deleting old partitions...");
-                    match run(&mut client, &table.name, p) {
-                        Ok(d) => println!("deleted {} rows", d),
-                        Err(e) => println!("error: {}", e),
+                        let mut prompt = TextPrompt::new(format!(
+                            "how many {}s do you want to retain?",
+                            table.partition_by
+                        ))
+                        .with_validator(|s| -> Result<(), String> {
+                            match s.parse::<i32>() {
+                                Ok(..) => Ok(()),
+                                Err(e) => Err(format!("error: {}", e)),
+                            }
+                        });
+
+                        match block_on(prompt.run()) {
+                            Ok(Some(a)) => {
+                                let p = new_retention_period(
+                                    a.parse::<i64>().unwrap(),
+                                    table.partition_by,
+                                )
+                                .unwrap();
+
+                                println!("Deleting old partitions...");
+                                match run(&mut client, &table.name, p) {
+                                    Ok(d) => println!("deleted {} rows", d),
+                                    Err(e) => {
+                                        println!("error: {}", e);
+                                        exit(1);
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                println!("You typed nothing");
+                                exit(1);
+                            }
+                            Err(e) => {
+                                println!("error: {}", e);
+                                exit(1);
+                            }
+                        }
                     }
                 }
-                Ok(None) => println!("You typed nothing"),
-                Err(e) => println!("error: {}", e),
+                println!("table not found '{}'", t);
+                exit(1);
             }
+
+            Ok(None) => {
+                println!("no table supplied... exiting");
+                exit(1)
+            }
+            Err(e) => println!("error: {}", e),
         }
     }
 }
