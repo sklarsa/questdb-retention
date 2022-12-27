@@ -191,6 +191,12 @@ fn main() {
                         "Added retention period of {} {}s for {}",
                         p.amount, p.partition_by, table.name
                     );
+
+                    println!("Now running cleanup...");
+                    match run(&mut client, &table.name, p) {
+                        Ok(()) => println!("done!"),
+                        Err(e) => println!("{}", e),
+                    }
                 }
                 Ok(None) => println!("You typed nothing"),
                 Err(e) => println!("error: {}", e),
