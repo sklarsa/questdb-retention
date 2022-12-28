@@ -111,7 +111,7 @@ fn row_to_table(r: &Row) -> Result<Table, RetentionPeriodError> {
     }
 }
 
-fn get_timestamp_col(client: &mut Client, table: &String) -> Result<String, postgres::Error> {
+fn get_timestamp_col(client: &mut Client, table: &str) -> Result<String, postgres::Error> {
     let query = format!(
         "SELECT designatedTimestamp FROM tables() WHERE name='{}'",
         table
@@ -130,7 +130,7 @@ fn get_oldest_timestamp(p: RetentionPeriod) -> Result<DateTime<Utc>, RetentionPe
     }
 }
 
-fn run(client: &mut Client, table: &String, p: RetentionPeriod) -> Result<u64, Box<dyn Error>> {
+fn run(client: &mut Client, table: &str, p: RetentionPeriod) -> Result<u64, Box<dyn Error>> {
     // Get timestamp column
     let timestamp_col = get_timestamp_col(client, table)?;
 
@@ -161,7 +161,7 @@ struct Config {
     conn_str: String,
 }
 
-fn parse_config(path: &String) -> Result<Config, String> {
+fn parse_config(path: &str) -> Result<Config, String> {
     match File::open(path) {
         Ok(f) => match serde_yaml::from_reader::<File, Config>(f) {
             Ok(c) => Ok(c),
