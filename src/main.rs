@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self};
 use std::fs::File;
-use std::process::exit;
 use std::str::FromStr;
 
 #[derive(Debug)]
@@ -162,117 +161,120 @@ struct Config {
     conn_str: String,
 }
 
-fn main() {
+fn parse_config(path: &String) -> Result<Config, String> {
+    match File::open(path) {
+        Ok(f) => match serde_yaml::from_reader::<File, Config>(f) {
+            Ok(c) => Ok(c),
+            Err(e) => Err(e.to_string()),
+        },
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn run_interactive(client: &mut Client) -> Result<(), String> {
+    let mut prompt = TextPrompt::new(format!("which table do you want to truncate?"));
+
+    match block_on(prompt.run()) {
+        Ok(Some(t)) => {
+            for row in client.query("tables()", &[]).unwrap() {
+                if String::from_str(row.get("name")).unwrap() == t {
+                    let table = row_to_table(&row).unwrap();
+                    if table.partition_by == PartitionBy::None {
+                        return Err(RetentionPeriodError::InvalidPartitionBy(table.partition_by)
+                            .to_string());
+                    }
+
+                    let mut prompt = TextPrompt::new(format!(
+                        "how many {}s do you want to retain?",
+                        table.partition_by
+                    ))
+                    .with_validator(|s| -> Result<(), String> {
+                        match s.parse::<i32>() {
+                            Ok(..) => Ok(()),
+                            Err(e) => Err(format!("error: {}", e)),
+                        }
+                    });
+
+                    match block_on(prompt.run()) {
+                        Ok(Some(a)) => {
+                            let p =
+                                new_retention_period(a.parse::<i64>().unwrap(), table.partition_by)
+                                    .unwrap();
+
+                            println!("Deleting old partitions...");
+                            match run(client, &table.name, p) {
+                                Ok(d) => println!("deleted {} rows", d),
+                                Err(e) => return Err(e.to_string()),
+                            }
+                        }
+                        Ok(None) => {
+                            return Err(String::from("You typed nothing"));
+                        }
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+            }
+            return Err(String::from(format!("table not found '{}'", t)));
+        }
+
+        Ok(None) => {
+            return Err(String::from("no table supplied... exiting"));
+        }
+        Err(e) => return Err(e.to_string()),
+    }
+}
+
+fn run_from_config(client: &mut Client, tables: HashMap<String, i64>) -> Result<(), String> {
+    for t in tables.keys() {
+        match run_one(client, t.clone(), tables.get(t).unwrap()) {
+            Ok(m) => println!("{}", m),
+            Err(e) => println!("{}", e),
+        }
+    }
+    Ok(())
+}
+
+fn run_one(client: &mut Client, table: String, amount: &i64) -> Result<String, String> {
+    match client.query_one("SELECT * FROM tables() WHERE name=$1", &[&table]) {
+        Ok(r) => match row_to_table(&r) {
+            Ok(t) => match new_retention_period(*amount, t.partition_by) {
+                Ok(p) => match run(client, &t.name, p) {
+                    Ok(n) => Ok(format!("{} rows deleted from {}", n, t.name)),
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        },
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn main() -> Result<(), String> {
     let args = Args::parse();
     let mut conn_str = String::from("host=localhost user=admin password=quest port=8812");
     let mut tables: HashMap<String, i64> = HashMap::new();
-
     if args.config_path != "" {
-        match File::open(args.config_path) {
-            Ok(f) => match serde_yaml::from_reader::<File, Config>(f) {
-                Ok(c) => {
-                    conn_str = c.conn_str;
-                    tables = c.tables;
-                }
-                Err(e) => {
-                    println!("invalid config: {}", e);
-                    exit(1);
-                }
-            },
-            Err(e) => {
-                println!("error opening config: {}", e);
-                exit(1);
+        match parse_config(&args.config_path) {
+            Ok(c) => {
+                conn_str = c.conn_str;
+                tables = c.tables;
             }
+            Err(e) => return Err(e),
         }
     }
 
     let mut client = Client::connect(&conn_str, NoTls).unwrap();
 
     if args.interactive {
-        let mut prompt = TextPrompt::new(format!("which table do you want to truncate?"));
-
-        match block_on(prompt.run()) {
-            Ok(Some(t)) => {
-                for row in client.query("tables()", &[]).unwrap() {
-                    if String::from_str(row.get("name")).unwrap() == t {
-                        let table = row_to_table(&row).unwrap();
-                        if table.partition_by == PartitionBy::None {
-                            println!(
-                                "table {} partitionBy == NONE, cannot evaluation retention",
-                                t
-                            );
-                            exit(1);
-                        }
-
-                        let mut prompt = TextPrompt::new(format!(
-                            "how many {}s do you want to retain?",
-                            table.partition_by
-                        ))
-                        .with_validator(|s| -> Result<(), String> {
-                            match s.parse::<i32>() {
-                                Ok(..) => Ok(()),
-                                Err(e) => Err(format!("error: {}", e)),
-                            }
-                        });
-
-                        match block_on(prompt.run()) {
-                            Ok(Some(a)) => {
-                                let p = new_retention_period(
-                                    a.parse::<i64>().unwrap(),
-                                    table.partition_by,
-                                )
-                                .unwrap();
-
-                                println!("Deleting old partitions...");
-                                match run(&mut client, &table.name, p) {
-                                    Ok(d) => println!("deleted {} rows", d),
-                                    Err(e) => {
-                                        println!("error: {}", e);
-                                        exit(1);
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                println!("You typed nothing");
-                                exit(1);
-                            }
-                            Err(e) => {
-                                println!("error: {}", e);
-                                exit(1);
-                            }
-                        }
-                    }
-                }
-                println!("table not found '{}'", t);
-                exit(1);
-            }
-
-            Ok(None) => {
-                println!("no table supplied... exiting");
-                exit(1)
-            }
-            Err(e) => println!("error: {}", e),
-        }
-
-        exit(0);
+        return run_interactive(&mut client);
     }
 
-    for t in tables.keys() {
-        match client.query_one("SELECT * FROM tables() WHERE name=$1", &[t]) {
-            Ok(r) => match row_to_table(&r) {
-                Ok(t) => {
-                    match new_retention_period(tables.get(&t.name).unwrap().clone(), t.partition_by)
-                    {
-                        Ok(p) => match run(&mut client, &t.name, p) {
-                            Ok(n) => println!("{} rows deleted from {}", n, t.name),
-                            Err(e) => println!("error evaluating table '{}': {}", t.name, e),
-                        },
-                        Err(e) => println!("{}", e),
-                    }
-                }
-                Err(e) => println!("{}", e),
-            },
-            Err(e) => println!("error: {}", e),
-        }
+    if args.config_path != "" {
+        return run_from_config(&mut client, tables);
     }
+
+    Err(String::from(
+        "must choose interactive mode or pass a config file",
+    ))
 }
